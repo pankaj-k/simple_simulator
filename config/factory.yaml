@@ -1,0 +1,27 @@
+factory:
+  name: "SmartFactory_01"
+  site: "Plant_A"
+
+simulation:
+  tick_interval: 2.0   # seconds between simulation updates
+
+opcua:
+  endpoint: "opc.tcp://0.0.0.0:4840/factory/"
+  namespace: "urn:factory:simulator"
+
+mqtt:
+  broker: "localhost"
+  port: 1883
+  username: ""
+  password: ""
+  topic_prefix: "factory"
+  qos: 0
+
+sparkplug:
+  broker: "localhost"
+  port: 1883
+  username: ""
+  password: ""
+  group_id: "Factory_01"
+  edge_node_id: "Edge_Node_01"
+  qos: 0
