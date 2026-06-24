@@ -82,6 +82,18 @@ sparkplug:
 
 Pick the protocol you want to learn. Run the simulator first, then connect Ignition to it.
 
+Add `--test` to any mode to enable fault injection — tags randomly go `Bad` and recover, so you can test your quality alarm pipeline without waiting for a real sensor failure:
+
+```bash
+python -m simulator.main opcua --test
+```
+
+Console output in test mode:
+```
+22:51:03 WARNING  simulator.factory.fault_injector: Quality FAULT      CNC_01                ToolWear_pct                   (47s)
+22:51:50 INFO     simulator.factory.fault_injector: Quality RECOVERED  CNC_01                ToolWear_pct
+```
+
 ### Mode 1 — OPC UA
 
 The simulator becomes an OPC UA **server**. Ignition's built-in OPC UA driver connects as a client.
@@ -291,7 +303,25 @@ Repeat the following for each area:
 | `factory-energy-kafka` | `[default]Factory/Energy/**` | `factory.energy` |
 | `factory-packaging-kafka` | `[default]Factory/Packaging/**` | `factory.packaging` |
 
-**2. Subscribe to tags using wildcards — not device folders**
+**2. Set the Change Triggers — and why Timestamp will ruin your day**
+
+The Source stage has three checkboxes: **Value**, **Quality**, and **Timestamp**. All three are enabled by default.
+
+| Trigger | What fires an event | Keep it? |
+|---|---|---|
+| **Value** | Any tag value changes | ✅ Yes — this is your actual data |
+| **Quality** | Tag quality changes (Good → Bad, Bad → Good) | ⚠️ Maybe — useful for fault detection, but keep it separate (see below) |
+| **Timestamp** | Every scan tick, regardless of whether anything changed | ❌ No — uncheck this immediately |
+
+**Why Timestamp is a problem:** Ignition updates timestamps on every scan cycle even when the value is identical. With Timestamp checked, a 2-second tick interval and 30 tags generates ~900 Kafka messages per minute of pure clock-tick noise — same `value`, same `quality`, different timestamp. Your Kafka topic fills up, your Transform script runs 900 times a minute for nothing, and a downstream consumer has no way to tell a real change from a heartbeat.
+
+**Recommendation: uncheck Timestamp, uncheck Quality, keep only Value.**
+
+Once you do this, every event that reaches Kafka is implicitly a value-change event — no `trigger` field needed because it is always true.
+
+**If you later need quality-change alerting** (e.g. detect a sensor going Bad): create a *separate* Event Stream — `factory-assembly-health-kafka` — with only Quality checked, routing to a `factory.alerts` topic. Keeping value-change data and quality-change events in separate streams makes each stream's purpose explicit and keeps your main data topics clean.
+
+**3. Subscribe to tags using wildcards — not device folders**
 
 Ignition Event Streams supports wildcards in tag paths (added in 8.3.4). Use them — they're far cleaner than listing every tag individually, and new devices or tags are picked up automatically without changing the event stream config.
 
@@ -341,11 +371,98 @@ Value: { "value": "RUNNING", "quality": "Good", "timestamp": 1782218920495 }
 
 The key carries the full tag path so consumers know both the device (`CNC_01`) and the tag (`State`). All tags from `CNC_01` hash to the same partition, preserving per-device ordering.
 
-**4. Save and enable**
+**4. Enrich the payload in the Transform stage**
+
+By default the Kafka message value is:
+```json
+{ "value": 419, "quality": "Good", "timestamp": 1782224819614 }
+```
+
+This is useless to a downstream consumer — there is no tag name, no device name, no area. A consumer reading `"value": 419` has no idea if that is PartCount, ToolWear, or something else entirely.
+
+Fix this in the **Transform** stage (the currently-disabled stage in the pipeline). Click on Transform, enable it, and paste this script:
+
+```python
+def transform(event, state):
+    # event.metadata.tagPath = "[default]Factory/Assembly/Robot_Arm_01/PartCount"
+    parts = event.metadata.tagPath.split("/")
+    #  [0]=[default]Factory  [1]=Assembly  [2]=Robot_Arm_01  [3]=PartCount
+
+    if len(parts) < 4:
+        return None  # drop malformed paths cleanly rather than sending bad data
+
+    enriched = dict(event.data)          # copy existing value/quality/timestamp
+    enriched["area"]       = parts[1]    # "Assembly"
+    enriched["machine_id"] = parts[2]    # "Robot_Arm_01"
+    enriched["tag"]        = parts[3]    # "PartCount"
+
+    return system.util.jsonEncode(enriched)
+```
+
+`system.util.jsonEncode()` is the Ignition built-in that converts the Python dict to a JSON string. The Kafka handler sends that string as the message body bytes.
+
+After the transform, the Kafka message becomes:
+```json
+{
+  "area":       "Assembly",
+  "machine_id": "Robot_Arm_01",
+  "tag":        "PartCount",
+  "value":      419,
+  "quality":    "Good",
+  "timestamp":  1782224819614
+}
+```
+
+Every downstream consumer — TimescaleDB, S3, ClickHouse, a Python script — can now understand the message in isolation without parsing the key or knowing the topic structure.
+
+> **Why enrich here and not downstream?** Fix data as early as possible in the pipeline. If you enrich in the consumer, every consumer independently does the same parsing. If the tag path format ever changes, you fix it in one place — the Transform script — and all consumers benefit automatically.
+
+> **`dict(event.data)` vs hardcoding fields:** Using `dict(event.data)` copies whatever fields the encoder put in (`value`, `quality`, `timestamp`) and then adds the new ones on top. If Ignition ever adds a field to `event.data`, it carries through automatically without changing the script.
+
+> **Returning `None` drops the event.** This is intentional for malformed paths. Sending incomplete data downstream is worse than sending nothing — a consumer that receives `{ "area": "Assembly", "machine_id": "CNC_01", "tag": "" }` will silently produce wrong results.
+
+**5. Save and enable**
 
 Click **Enabled** (top right). Check the pipeline counters — the number under **Handlers** should increment as tag changes flow through.
 
 > **Expression bindings that work in the Kafka handler:** `{event.metadata.tagPath}` and `{event.data}` are the correct syntax. Expressions like `{tagPath}`, `{event.tagPath}`, `{event}`, or `{payload}` do NOT work — Ignition treats bare `{}` expressions as tag reads, not event bindings, and returns `Bad_NotFound`.
+
+**6. Configure the Error Handler**
+
+The Error Handler is the last stage in the pipeline (the dashed circle after Handlers). By default it is empty — errors are silently swallowed, and you will have no idea why data stops flowing.
+
+The default code is:
+```python
+def onError(event, state):
+```
+
+Replace it with:
+```python
+def onError(event, state):
+    logger = system.util.getLogger("factory.stream")
+
+    try:
+        tag = event.metadata.tagPath
+    except:
+        tag = "unknown"
+
+    try:
+        error = str(event.error)
+    except:
+        try:
+            error = str(event.cause)
+        except:
+            error = "unknown error"
+
+    logger.error("Pipeline error | tag=%s | error=%s" % (tag, error))
+```
+
+Errors are then visible in **Config → Logs** — filter by logger name `factory.stream`.
+
+Notes on the `try/except` blocks:
+- `event.metadata.tagPath` might not be populated if the error happened before the event was enriched (e.g. a Confluent connection failure)
+- `event.error` vs `event.cause` — Ignition's exact property name is not confirmed in the docs; this tries both so at least one works
+- Once an error fires, check the log to see which property name was actually available and tighten the script
 
 > **Per-tag vs per-device partition routing — understand the tradeoff:**
 >
@@ -365,6 +482,142 @@ Click **Enabled** (top right). Check the pipeline counters — the number under 
 > | Fault correlation (State + PartCount together in order) | ⚠️ multi-partition read needed | ✅ single partition |
 >
 > **For learning and tag-level analytics, per-tag keying is fine.** If you later need strict per-device ordering, change the Key expression to extract only the device segment from the path — for example `split({event.metadata.tagPath}, "/")[2]` to extract `CNC_02` — so all tags from the same device share one key and land in one partition.
+
+### Step 5 — Monitor quality changes (why Event Streams falls short, and what to use instead)
+
+Tag quality changes silently — a sensor can go `Bad` and keep publishing its last-known value indefinitely. Nothing in the value-change stream tells you this has happened because the value itself didn't change. You need a dedicated quality monitoring path to catch it.
+
+**Why you want this in Kafka:**
+- One `factory.quality` topic for all areas — alerting is cross-area by nature
+- Volume is low (sensors don't go Bad constantly) — no need for per-area topics
+- Consumers are different: value data feeds analytics; quality events feed an alerting system (Slack, PagerDuty, anomaly detector)
+- 7-day retention recommended — longer than value topics so you can correlate a bad sensor with past anomalies
+
+**The natural instinct: use Event Streams with Quality trigger — and why it doesn't work**
+
+The first thing you'll try is creating an Event Stream with the Quality change trigger checked and `**` wildcards — the same pattern that works perfectly for value changes. It does not work. Here is exactly what happens and why.
+
+With **Value** trigger, `**` fires one event **per leaf tag** that changes:
+```
+event.metadata.tagPath = [default]Factory/Assembly/CNC_01/ToolWear_pct   ← 4 segments ✅
+```
+
+With **Quality** trigger, `**` fires one event **per subscribed folder root**:
+```
+event.metadata.tagPath = [default]Factory/Assembly   ← 2 segments ❌
+```
+
+The path only has 2 segments when split by `/`. The Transform script drops it (`len(parts) < 4 → return None`). Nothing reaches Kafka. Even if you remove the guard, the payload carries no device name and no tag name — just `{ "value": 2, "quality": "Good", "timestamp": ... }` where `value: 2` is Ignition's internal folder quality code, not a sensor reading.
+
+**Why can't you get the tag name?**
+
+Ignition fires quality rollup events at the folder level when any child tag's quality changes. It does not fire one event per affected tag — it fires one event per subscription root. So with `[default]Factory/Assembly/**` as the source, one Quality event covers the entire Assembly area. The specific tag that went Bad is not in `event.metadata.tagPath` and is not in `event.data`. It is simply not available in the Event Streams quality event payload.
+
+**What about subscribing per device?**
+
+You might try replacing the area wildcards with one line per device:
+```
+[default]Factory/Assembly/CNC_01/**
+[default]Factory/Assembly/CNC_02/**
+...
+```
+
+Based on the same rollup behaviour, quality events fire at `[default]Factory/Assembly/CNC_01` (3 segments). You gain the device name but still lose the tag name. And you've gone from 4 wildcard lines to 9 device lines — any new device added to the simulator requires a matching change in Ignition.
+
+**What about subscribing per tag (no wildcards)?**
+
+Subscribing to each individual tag path gives 4-segment paths and therefore the exact tag name. But that means listing ~40 paths explicitly for this factory, and every new tag added to the simulator requires an Ignition config change. Fragile and not maintainable.
+
+**Event Streams source types available**
+
+The Ignition Event Stream source dropdown offers: Event Listener, Kafka, MQTT, Sparkplug, Tag Event. There is no Alarm Event source. Tag Event with Quality trigger is the only tag-quality path in Event Streams, and it has the folder-rollup limitation above.
+
+**The right approach: Ignition Alarms → Kafka**
+
+Ignition Alarms are designed for exactly this. Configure a quality alarm on each tag (built-in alarm type, triggers when quality transitions to non-Good). Alarms know the exact tag path, the device, the transition time, the previous quality state, and whether the alarm is acknowledged. They survive Ignition restarts and are written to a persistent alarm journal.
+
+Getting alarms into Kafka requires one of two paths. **Check which is available in your install first.**
+
+**Confirmed path — Event Stream Source block in the Alarm Notification Pipeline**
+
+Ignition's Alarm Notification Pipeline has a native **Event Stream Source** block (visible in the Pipeline Blocks toolbar in the Designer, alongside Notification, Script, Delay etc.). This block feeds alarm event data directly into an Event Stream that uses an **Event Listener** source — no scripting required in the pipeline itself.
+
+The full chain:
+
+```
+Alarm fires
+  → Alarm Notification Pipeline
+      → Event Stream Source block ──→ factory-alarm-listener (Event Listener source)
+                                              → Transform script
+                                                  → Kafka Handler → factory.quality
+```
+
+**1. Create the Event Stream**
+
+Go to **Config → Event Streams → Add Event Stream**. Name it `factory-alarm-listener`. Set the source type to **Event Listener**. Add a Kafka handler pointing at `factory.quality`. Enable the Transform stage (see script below).
+
+**2. Configure the Alarm Notification Pipeline**
+
+In the Designer, open (or create) an Alarm Notification Pipeline. Drag the **Event Stream Source** block from the Pipeline Blocks toolbar onto the canvas. Connect it after START. In the block's properties panel, set the **Event Stream** dropdown to `factory-alarm-listener`.
+
+The alarm event data passed to the Event Stream is an **AlarmEventObject** — it carries the tag source path, alarm state, priority, active time, clear time, and any custom alarm properties. This is the object that arrives as `event.data` in the Transform script.
+
+**3. Transform script for alarm events**
+
+The AlarmEventObject is not a plain dict, so `dict(event.data)` does not work here. Access properties directly:
+
+```python
+def transform(event, state):
+    logger = system.util.getLogger("factory.stream")
+    try:
+        alarm    = event.data
+        tag_path = str(alarm.source)           # "[default]Factory/Assembly/CNC_01/ToolWear_pct"
+        parts    = tag_path.split("/")
+
+        enriched = {
+            "tag":        tag_path,
+            "area":       parts[1] if len(parts) > 1 else "unknown",
+            "machine_id": parts[2] if len(parts) > 2 else "unknown",
+            "tag_name":   parts[3] if len(parts) > 3 else "unknown",
+            "state":      str(alarm.state),
+            "priority":   str(alarm.priority),
+            "timestamp":  alarm.eventTime.getTime()
+        }
+        return system.util.jsonEncode(enriched)
+    except Exception as e:
+        logger.error("alarm transform failed: " + str(e))
+        return None
+```
+
+> **First run tip:** Add `logger.info("alarm event data: " + str(dir(event.data)))` before the try block to see all available properties on the AlarmEventObject. Remove it once you've confirmed the field names.
+
+> **`system.kafka` does not exist.** The Kafka Connector module (as of Ignition 8.3) does not expose a scripting namespace. Running `print(dir(system.kafka))` in the Script Console throws `AttributeError`. The Event Stream Source block approach above is the only supported path for routing alarm events to Kafka.
+
+**A quality alarm message in `factory.quality` should look like:**
+
+```json
+{
+  "tag":         "[default]Factory/Assembly/CNC_01/ToolWear_pct",
+  "label":       "Assembly/CNC_01/ToolWear_pct",
+  "state":       "Active",
+  "quality":     "Bad_NotConnected",
+  "active_time": "2026-06-24T22:43:45",
+  "timestamp":   1782231045123
+}
+```
+
+This tells a downstream consumer exactly which tag went Bad, when it went Bad, and whether the alarm is still active — everything the Event Streams Quality trigger approach cannot deliver.
+
+> **Summary of all streams and topics:**
+>
+> | Source | Ignition config | Kafka topic | Per-tag? |
+> |---|---|---|---|
+> | `factory-assembly-kafka` Event Stream | Tag Event / Value | `factory.assembly` | ✅ |
+> | `factory-process-kafka` Event Stream | Tag Event / Value | `factory.process` | ✅ |
+> | `factory-energy-kafka` Event Stream | Tag Event / Value | `factory.energy` | ✅ |
+> | `factory-packaging-kafka` Event Stream | Tag Event / Value | `factory.packaging` | ✅ |
+> | Alarm Notification Pipeline | Script → Kafka or Event Listener | `factory.quality` | ✅ |
+> | ~~`tag_quality_stream` Event Stream~~ | ~~Tag Event / Quality~~ | ~~`factory.quality`~~ | ❌ folder-level only |
 
 ---
 

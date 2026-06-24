@@ -9,6 +9,7 @@ class Tag:
     value: Any
     unit: str = ""
     datatype: str = "float"  # float | int | bool | string
+    quality: str = "Good"    # "Good" | "Bad" — set by FaultInjector in test mode
 
 
 class Device(ABC):

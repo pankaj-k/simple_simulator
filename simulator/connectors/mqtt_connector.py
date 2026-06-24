@@ -43,7 +43,7 @@ class MqttConnector:
                 "area": device.area,
                 "device": device.device_id,
                 "tags": {
-                    name: {"v": tag.value, "u": tag.unit}
+                    name: {"v": tag.value, "u": tag.unit, "q": tag.quality}
                     for name, tag in device.get_tags().items()
                 },
             }
@@ -54,20 +54,23 @@ class MqttConnector:
         self._client.loop_stop()
         self._client.disconnect()
 
-    async def run(self, devices: list[Device], tick: float) -> None:
+    async def run(self, devices: list[Device], tick: float, fault_injector=None) -> None:
         self.connect()
         logger.info(
-            "Plain MQTT publishing to %s:%s | prefix=%s | %d devices | tick=%.1fs",
+            "Plain MQTT publishing to %s:%s | prefix=%s | %d devices | tick=%.1fs%s",
             self._config.get("broker"),
             self._config.get("port"),
             self._prefix,
             len(devices),
             tick,
+            " [FAULT INJECTION ON]" if fault_injector else "",
         )
         try:
             while True:
                 for device in devices:
                     device.tick(tick)
+                if fault_injector:
+                    fault_injector.inject(tick)
                 self.publish(devices)
                 await asyncio.sleep(tick)
         finally:

@@ -111,21 +111,24 @@ class SparkplugConnector:
         self._client.loop_stop()
         self._client.disconnect()
 
-    async def run(self, devices: list[Device], tick: float) -> None:
+    async def run(self, devices: list[Device], tick: float, fault_injector=None) -> None:
         self.connect(devices)
         logger.info(
-            "Sparkplug B publishing to %s:%s | group=%s node=%s | %d devices | tick=%.1fs",
+            "Sparkplug B publishing to %s:%s | group=%s node=%s | %d devices | tick=%.1fs%s",
             self._config.get("broker"),
             self._config.get("port"),
             self._group,
             self._node,
             len(devices),
             tick,
+            " [FAULT INJECTION ON]" if fault_injector else "",
         )
         try:
             while True:
                 for device in devices:
                     device.tick(tick)
+                if fault_injector:
+                    fault_injector.inject(tick)
                 self.publish(devices)
                 await asyncio.sleep(tick)
         finally:

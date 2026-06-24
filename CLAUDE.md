@@ -25,15 +25,28 @@ simulator/
     └── sparkplug_connector.py
 ```
 
-Entry point: `python -m simulator.main [opcua|mqtt|sparkplug]`
+Entry point: `python -m simulator.main [opcua|mqtt|sparkplug] [--test]`
 Config: `config/factory.yaml`
 
 ## Key conventions
 
 - Every device subclasses `Device` from `simulator/factory/base.py`. Required method: `tick(elapsed: float)`.
 - Tags are written via `self._set(name, value, unit="", datatype="float")`. Valid datatypes: `float`, `int`, `bool`, `string`.
+- `Tag` has a `quality: str` field (`"Good"` by default). Only `FaultInjector` writes `"Bad"` to it — devices never touch quality directly.
 - Connectors read `device.get_tags()` — they never reach into device internals.
-- All connectors expose `async def run(devices, tick)` so `main.py` calls them uniformly with `asyncio.run()`.
+- All connectors expose `async def run(devices, tick, fault_injector=None)` so `main.py` calls them uniformly with `asyncio.run()`.
+
+## Test mode (fault injection)
+
+`python -m simulator.main opcua --test` enables `FaultInjector` (`simulator/factory/fault_injector.py`).
+
+Each tick, after all `device.tick()` calls, `fault_injector.inject(elapsed)` runs. It randomly sets `tag.quality = "Bad"` on individual tags (~0.2% chance per tag per 2s tick) and recovers them after 30–120 seconds. The connector then writes the appropriate quality status to the protocol:
+
+- **OPC UA**: writes `ua.StatusCode(ua.StatusCodes.BadDeviceFailure)` on the `DataValue` — Ignition sees the tag go `Bad_DeviceFailure`
+- **MQTT**: adds `"q": "Bad"` field to the tag object in the JSON payload
+- **Sparkplug B**: `tag.quality` is set but not yet encoded in the binary payload (Sparkplug quality encoding not implemented)
+
+Fault events are logged at WARNING; recoveries at INFO. Look for `Quality FAULT` and `Quality RECOVERED` lines in the console.
 
 ## OPC UA connector — known gotcha
 
@@ -64,7 +77,7 @@ Nothing else changes — all three connectors pick it up automatically.
 ## Adding a new connector / protocol
 
 1. Create `simulator/connectors/<protocol>_connector.py`.
-2. Implement `async def run(devices: list[Device], tick: float) -> None`.
+2. Implement `async def run(devices: list[Device], tick: float, fault_injector=None) -> None`. Call `fault_injector.inject(tick)` after device ticks if not None.
 3. Add an entry to `_RUNNERS` dict in `simulator/main.py`.
 
 ## Dependencies

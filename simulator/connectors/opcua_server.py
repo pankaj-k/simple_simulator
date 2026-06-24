@@ -17,7 +17,7 @@ class OpcUaConnector:
     def __init__(self, config: dict):
         self._config = config
 
-    async def run(self, devices: list[Device], tick: float) -> None:
+    async def run(self, devices: list[Device], tick: float, fault_injector=None) -> None:
         server = Server()
         await server.init()
         server.set_endpoint(self._config.get("endpoint", "opc.tcp://0.0.0.0:4840/factory/"))
@@ -47,22 +47,28 @@ class OpcUaConnector:
 
         async with server:
             logger.info(
-                "OPC UA server listening on %s | %d devices | tick=%.1fs",
+                "OPC UA server listening on %s | %d devices | tick=%.1fs%s",
                 self._config.get("endpoint"),
                 len(devices),
                 tick,
+                " [FAULT INJECTION ON]" if fault_injector else "",
             )
             while True:
                 for device in devices:
                     device.tick(tick)
+                if fault_injector:
+                    fault_injector.inject(tick)
 
                 for device in devices:
                     for tag_name, tag in device.get_tags().items():
                         entry = node_map.get((device.device_id, tag_name))
                         if entry:
                             var_node, vtype = entry
-                            await var_node.write_value(
-                                ua.DataValue(ua.Variant(tag.value, vtype))
-                            )
+                            if tag.quality != "Good":
+                                status = ua.StatusCode(ua.StatusCodes.BadDeviceFailure)
+                                dv = ua.DataValue(ua.Variant(tag.value, vtype), StatusCode_=status)
+                            else:
+                                dv = ua.DataValue(ua.Variant(tag.value, vtype))
+                            await var_node.write_value(dv)
 
                 await asyncio.sleep(tick)
