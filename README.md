@@ -598,26 +598,60 @@ Tag quality has exactly three values: **Good**, **Uncertain**, **Bad**. Configur
 
 **Configuring alarms on all tags automatically**
 
-Rather than clicking each tag individually, run this once in **Tools → Script Console** to add quality alarms to every tag under Factory in one shot. The `"m"` (merge) mode is idempotent — safe to run repeatedly without creating duplicates:
+Rather than clicking each tag individually, run this once in **Tools → Script Console** to add a `QualityBad` alarm to every atomic tag under Factory. The `"m"` (merge) mode is idempotent — safe to run repeatedly without creating duplicates.
+
+> **Critical:** `basePath` in `system.tag.configure()` must be the **parent folder** of each tag, not `[default]`. Passing `"[default]"` as the base with a nested path in the config dict does not navigate to the existing tag — it silently creates a ghost root-level tag with the same name and stacks alarms onto that instead. The correct pattern splits each full path into parent + name with `rfind("/")`.
 
 ```python
-results = system.tag.browse("[default]Factory", {"recursive": True})
-configs = []
-for tag in results.getResults():
-    configs.append({
-        "path": str(tag["fullPath"]),
-        "alarms": [
-            {"name": "QualityBad",       "mode": "BadQuality",       "priority": "High"},
-            {"name": "QualityUncertain", "mode": "UncertainQuality", "priority": "Medium"},
-        ]
-    })
-if configs:
-    system.tag.configure("[default]", configs, "m")
+alarm_config = {
+    "name": "QualityBad",
+    "mode": "Bad Quality",          # ← space required; "BadQuality" silently does nothing
+    "priority": "High",
+    "activePipeline": "FactorySimulator_OPC_UA/factory-quality-pipeline"
+    # ↑ field is "activePipeline", not "pipeline". Format: "ProjectName/PipelineName"
+}
+
+def collect_atomic_tags(path, results):
+    for tag in system.tag.browse(path).getResults():
+        tag_type = str(tag["tagType"])
+        full_path = str(tag["fullPath"])
+        if tag_type == "AtomicTag":
+            results.append(full_path)
+        elif tag_type in ("Folder", "UdtInstance"):
+            collect_atomic_tags(full_path, results)
+
+all_tags = []
+collect_atomic_tags("[default]Factory", all_tags)
+print("Found", len(all_tags), "tags")
+
+count, errors = 0, []
+for full_path in all_tags:
+    idx    = full_path.rfind("/")
+    parent = full_path[:idx]        # "[default]Factory/Assembly/CNC_01"
+    name   = full_path[idx+1:]      # "PartCount"
+    result = system.tag.configure(parent, [{"name": name, "alarms": [alarm_config]}], "m")
+    if result and str(result[0]) == "Good":
+        count += 1
+    else:
+        errors.append((full_path, result))
+
+print("Configured:", count, "tags")
+if errors:
+    print("Errors:", errors)
 ```
+
+Verify one tag after running:
+```python
+check = system.tag.getConfiguration("[default]Factory/Assembly/CNC_01/PartCount", False)
+print(check[0].get("alarms", "NONE"))
+# Expected: [{u'activePipeline': u'...', u'priority': High, u'mode': Bad Quality, u'name': u'QualityBad'}]
+```
+
+> **If `getConfiguration` shows a root-level `PartCount` tag with many alarms stacked on it:** that is a ghost tag created by a previous run of the wrong script. Delete it from the tag browser (right-click → Delete). It is not an OPC UA tag. The correct script above will not create it.
 
 **Keeping alarms up to date as new devices are added**
 
-The script above only covers tags that exist at the moment you run it. When you add a new device to the simulator and restart it, new tags appear with no alarms. Fix this with a **Gateway Scheduled Script** that runs the same script automatically every 5 minutes.
+The script above only covers tags that exist at the moment you run it. When you add a new device to the simulator and restart it, new tags appear with no alarms. Fix this with a **Gateway Scheduled Script** that runs automatically every 5 minutes and only touches tags that are missing the alarm.
 
 In Ignition Designer: **Tools → Gateway Scripts → Scheduled → Add Script**
 
@@ -626,7 +660,37 @@ In Ignition Designer: **Tools → Gateway Scripts → Scheduled → Add Script**
 | Name | `alarm-auto-configure` |
 | Schedule (CRON Minutes field) | `*/5` — leave Hours, Days, Months, Weekdays as `*` |
 
-Paste the same script from above. Save (Ctrl+S) and **Publish** (Ctrl+Shift+P) — it won't run until published. Since the script uses merge mode, running it every 5 minutes is harmless. New tags from new simulator devices get their quality alarms within 5 minutes of appearing.
+```python
+alarm_config = {
+    "name": "QualityBad",
+    "mode": "Bad Quality",
+    "priority": "High",
+    "activePipeline": "FactorySimulator_OPC_UA/factory-quality-pipeline"
+}
+
+def collect_atomic_tags(path, results):
+    for tag in system.tag.browse(path).getResults():
+        tag_type = str(tag["tagType"])
+        full_path = str(tag["fullPath"])
+        if tag_type == "AtomicTag":
+            results.append(full_path)
+        elif tag_type in ("Folder", "UdtInstance"):
+            collect_atomic_tags(full_path, results)
+
+all_tags = []
+collect_atomic_tags("[default]Factory", all_tags)
+
+for full_path in all_tags:
+    check = system.tag.getConfiguration(full_path, False)
+    if check and not check[0].get("alarms"):          # skip tags that already have alarms
+        idx    = full_path.rfind("/")
+        parent = full_path[:idx]
+        name   = full_path[idx+1:]
+        system.tag.configure(parent, [{"name": name, "alarms": [alarm_config]}], "m")
+        system.util.getLogger("AlarmProvisioner").info("Added QualityBad alarm to " + full_path)
+```
+
+Save (Ctrl+S) and **Publish** (Ctrl+Shift+P) — it won't run until published. The `if not check[0].get("alarms")` guard means it skips tags that already have the alarm, so running every 5 minutes is cheap and harmless. New tags from new simulator devices get their alarm within 5 minutes of appearing.
 
 Getting alarms into Kafka requires one of two paths. **Check which is available in your install first.**
 
@@ -654,51 +718,138 @@ In the Designer, open (or create) an Alarm Notification Pipeline. Drag the **Eve
 
 The alarm event data passed to the Event Stream is an **AlarmEventObject** — it carries the tag source path, alarm state, priority, active time, clear time, and any custom alarm properties. This is the object that arrives as `event.data` in the Transform script.
 
-**3. Transform script for alarm events**
+**3. What the alarm event data actually looks like**
 
-The AlarmEventObject is not a plain dict, so `dict(event.data)` does not work here. Access properties directly:
+The event that arrives in the Transform is a `PyEventPayload` object. `event.data` is a Java-backed dict you can convert with `dict(event.data)`. A real alarm event from this simulator looks like:
 
 ```python
-def transform(event, state):
-    logger = system.util.getLogger("factory.stream")
-    try:
-        alarm    = event.data
-        tag_path = str(alarm.source)           # "[default]Factory/Assembly/CNC_01/ToolWear_pct"
-        parts    = tag_path.split("/")
-
-        enriched = {
-            "tag":        tag_path,
-            "area":       parts[1] if len(parts) > 1 else "unknown",
-            "machine_id": parts[2] if len(parts) > 2 else "unknown",
-            "tag_name":   parts[3] if len(parts) > 3 else "unknown",
-            "state":      str(alarm.state),
-            "priority":   str(alarm.priority),
-            "timestamp":  alarm.eventTime.getTime()
-        }
-        return system.util.jsonEncode(enriched)
-    except Exception as e:
-        logger.error("alarm transform failed: " + str(e))
-        return None
-```
-
-> **First run tip:** Add `logger.info("alarm event data: " + str(dir(event.data)))` before the try block to see all available properties on the AlarmEventObject. Remove it once you've confirmed the field names.
-
-> **`system.kafka` does not exist.** The Kafka Connector module (as of Ignition 8.3) does not expose a scripting namespace. Running `print(dir(system.kafka))` in the Script Console throws `AttributeError`. The Event Stream Source block approach above is the only supported path for routing alarm events to Kafka.
-
-**A quality alarm message in `factory.quality` should look like:**
-
-```json
 {
-  "tag":         "[default]Factory/Assembly/CNC_01/ToolWear_pct",
-  "label":       "Assembly/CNC_01/ToolWear_pct",
-  "state":       "Active",
-  "quality":     "Bad_NotConnected",
-  "active_time": "2026-06-24T22:43:45",
-  "timestamp":   1782231045123
+    'eventId':           '68afc44e-254a-4487-96bc-0257c251f146',
+    'eventFlags':        0,
+    'source':            'prov:default:/tag:Factory/Packaging/Packaging_Line_01/ConveyorSpeed_m_min:/alm:QualityBad',
+    'displayPath':       '',
+    'eventType':         2,
+    'priority':          3,
+    'eventTypeReadable': 'Active, Unacknowledged',
+    'priorityReadable':  'High',
+    'eventTime':         'Fri Jun 26 00:10:41 AEST 2026'
 }
 ```
 
-This tells a downstream consumer exactly which tag went Bad, when it went Bad, and whether the alarm is still active — everything the Event Streams Quality trigger approach cannot deliver.
+The key field is `source`. It follows the format:
+
+```
+prov:{provider}:/tag:{tag_path}:/alm:{alarm_name}
+```
+
+So `source.split("/tag:")[1].split(":/alm:")[0]` extracts `Factory/Packaging/Packaging_Line_01/ConveyorSpeed_m_min`.
+
+**4. Transform script for alarm events**
+
+```python
+def transform(event, state):
+    logger     = system.util.getLogger("alarm-transform")
+    try:
+        data       = dict(event.data)
+        raw_source = str(data.get("source", ""))
+
+        # Parse: prov:default:/tag:Factory/Assembly/CNC_01/PartCount:/alm:QualityBad
+        tag_path = raw_source.split("/tag:")[1].split(":/alm:")[0] if "/tag:" in raw_source else raw_source
+        alarm    = raw_source.split(":/alm:")[1]                   if ":/alm:" in raw_source else ""
+        parts    = tag_path.split("/")   # ['Factory', 'Assembly', 'CNC_01', 'PartCount']
+
+        result = {
+            "metadata": {"tagPath": tag_path},
+            "data": {
+                "tag_path":   tag_path,
+                "area":       parts[1] if len(parts) > 1 else "",
+                "device":     parts[2] if len(parts) > 2 else "",
+                "tag":        parts[3] if len(parts) > 3 else "",
+                "alarm":      alarm,
+                "state":      str(data.get("eventTypeReadable", "")),
+                "priority":   str(data.get("priorityReadable", "")),
+                "event_time": str(data.get("eventTime", "")),
+                "event_id":   str(data.get("eventId", ""))
+            }
+        }
+        logger.info("OUTPUT: " + str(result))
+        return result
+    except Exception as e:
+        logger.error("Transform FAILED: " + str(e))
+        return None
+```
+
+> **Transform function signature is `(event, state)`, not `(event, logger)`.** The second parameter is a persistent state dict, not a logger. Log via `system.util.getLogger("name")` inside the function body.
+
+> **Why wrap in try/except:** without it, any exception in the Transform is swallowed silently — the event counter increments but nothing reaches Kafka and there is no error in the logs.
+
+**5. Kafka handler configuration for `factory-alarm-listener`**
+
+| Field | Value | Notes |
+|---|---|---|
+| Connector | `confluent-kafka` | same connection as the other streams |
+| Topic | `'factory.quality'` | **single quotes required** — Ignition expression language; without quotes `factory.quality` is evaluated as an expression looking for variable `factory`, returns null, silently drops every message |
+| Key | *(leave blank)* | null key → Kafka distributes round-robin. `{event.metadata.tagPath}` and `{event.data.tag_path}` both fail — Ignition's expression engine cannot navigate nested Python dicts via dot notation after Transform returns a Python dict. The `tag_path` is inside the value payload anyway. |
+| Value | `{event.data}` | the `data` field from the Transform result dict |
+
+The resulting Kafka message in Confluent:
+
+```json
+{
+  "metadata": { "tagPath": "Factory/Assembly/CNC_01/PartCount" },
+  "data": {
+    "tag_path":   "Factory/Assembly/CNC_01/PartCount",
+    "area":       "Assembly",
+    "device":     "CNC_01",
+    "tag":        "PartCount",
+    "alarm":      "QualityBad",
+    "state":      "Active, Unacknowledged",
+    "priority":   "High",
+    "event_time": "Fri Jun 26 00:10:37 AEST 2026",
+    "event_id":   "fdfd711d-a711-42ea-afa2-587e62ae65d7"
+  }
+}
+```
+
+The `metadata.tagPath` is redundant with `data.tag_path` — both are there because `{event.data}` returns the entire dict the Transform returned (not just the inner `data` key). Downstream consumers should read from `data`.
+
+> **Ignition expression engine limitation:** After a Transform returns a Python dict, the handler expressions `{event.X}` and `{event.X.Y}` only work if the key `X` maps to a Java-accessible property. `{event.data}` works (accesses the `"data"` key of the top-level dict). `{event.data.tag_path}` fails ("Missing element") — the expression engine cannot recursively traverse nested Python dicts. This is why the Key is left blank rather than using `{event.data.tag_path}`.
+
+**A quality alarm message in `factory.quality` looks like:**
+
+```json
+{
+  "tag_path":   "Factory/Assembly/CNC_01/ToolWear_pct",
+  "area":       "Assembly",
+  "device":     "CNC_01",
+  "tag":        "ToolWear_pct",
+  "alarm":      "QualityBad",
+  "state":      "Active, Unacknowledged",
+  "priority":   "High",
+  "event_time": "Fri Jun 26 00:10:37 AEST 2026",
+  "event_id":   "fdfd711d-a711-42ea-afa2-587e62ae65d7"
+}
+```
+
+This tells a downstream consumer exactly which tag went Bad, when, and what state the alarm is in — everything the Event Streams Quality trigger approach cannot deliver.
+
+**6. Error Handler**
+
+Add an error handler so failures are logged rather than silently swallowed:
+
+```python
+def onError(event, state):
+    logger = system.util.getLogger("alarm-error")
+    logger.error("Error count: " + str(len(event)))
+    for item in event:
+        logger.error("Error item: " + str(item))
+```
+
+> **`event` in `onError` is a list**, not a single object. Accessing `event.stage` or `event.cause` throws `AttributeError: 'list' object has no attribute 'stage'`. Iterate over it.
+
+Check **Config → Logs** and filter by logger name `alarm-error` to see failures.
+
+> **`system.kafka` does not exist.** The Kafka Connector module (as of Ignition 8.3) does not expose a scripting namespace. Running `print(dir(system.kafka))` in the Script Console throws `AttributeError`. The Event Stream Source block approach above is the only supported path for routing alarm events to Kafka.
 
 > **Summary of all streams and topics:**
 >
