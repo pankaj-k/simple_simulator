@@ -64,11 +64,9 @@ class OpcUaConnector:
                         entry = node_map.get((device.device_id, tag_name))
                         if entry:
                             var_node, vtype = entry
+                            dv = ua.DataValue(ua.Variant(tag.value, vtype))
                             if tag.quality != "Good":
-                                status = ua.StatusCode(ua.StatusCodes.BadDeviceFailure)
-                                dv = ua.DataValue(ua.Variant(tag.value, vtype), StatusCode_=status)
-                            else:
-                                dv = ua.DataValue(ua.Variant(tag.value, vtype))
+                                dv.StatusCode = ua.StatusCode(ua.StatusCodes.BadDeviceFailure)
                             await var_node.write_value(dv)
 
                 await asyncio.sleep(tick)

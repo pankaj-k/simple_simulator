@@ -42,7 +42,7 @@ Config: `config/factory.yaml`
 
 Each tick, after all `device.tick()` calls, `fault_injector.inject(elapsed)` runs. It randomly sets `tag.quality = "Bad"` on individual tags (~0.2% chance per tag per 2s tick) and recovers them after 30–120 seconds. The connector then writes the appropriate quality status to the protocol:
 
-- **OPC UA**: writes `ua.StatusCode(ua.StatusCodes.BadDeviceFailure)` on the `DataValue` — Ignition sees the tag go `Bad_DeviceFailure`
+- **OPC UA**: sets `dv.StatusCode = ua.StatusCode(ua.StatusCodes.BadDeviceFailure)` on the `DataValue` — Ignition sees the tag go `Bad_DeviceFailure`. Note: the attribute is `StatusCode` not `StatusCode_` — confirmed by `dir(ua.DataValue())`
 - **MQTT**: adds `"q": "Bad"` field to the tag object in the JSON payload
 - **Sparkplug B**: `tag.quality` is set but not yet encoded in the binary payload (Sparkplug quality encoding not implemented)
 
