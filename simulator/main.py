@@ -40,12 +40,11 @@ def load_config(path: str = "config/factory.yaml") -> dict:
 
 
 def build_factory():
-    return (
-        create_assembly_line()
-        + create_process_tanks()
-        + create_energy_meters()
-        + create_packaging_lines()
-    )
+    assembly = create_assembly_line()
+    process  = create_process_tanks()
+    energy   = create_energy_meters(observed_machines=assembly)
+    packaging = create_packaging_lines(feeder_machines=assembly)
+    return assembly + process + energy + packaging
 
 
 async def run_opcua(config: dict, devices, tick: float, fault_injector=None) -> None:

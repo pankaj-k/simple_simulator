@@ -12,6 +12,11 @@ _VARIANT_TYPE = {
     "string": ua.VariantType.String,
 }
 
+_QUALITY_STATUS = {
+    "Uncertain": ua.StatusCodes.UncertainLastUsableValue,
+    "Bad":       ua.StatusCodes.BadDeviceFailure,
+}
+
 
 class OpcUaConnector:
     def __init__(self, config: dict):
@@ -65,8 +70,8 @@ class OpcUaConnector:
                         if entry:
                             var_node, vtype = entry
                             dv = ua.DataValue(ua.Variant(tag.value, vtype))
-                            if tag.quality != "Good":
-                                dv.StatusCode = ua.StatusCode(ua.StatusCodes.BadDeviceFailure)
+                            if tag.quality in _QUALITY_STATUS:
+                                dv.StatusCode = ua.StatusCode(_QUALITY_STATUS[tag.quality])
                             await var_node.write_value(dv)
 
                 await asyncio.sleep(tick)

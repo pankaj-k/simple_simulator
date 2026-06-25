@@ -6,16 +6,74 @@ A Python simulator that mimics a mixed industrial factory and streams live senso
 
 ## What it simulates
 
-The factory has four areas, each running continuously with realistic noise and fault injection:
+The factory has four areas. Devices are not independent — they are causally linked so that faults in one area produce measurable effects in others, exactly as they would on a real factory floor.
 
 | Area | Devices | Key tags |
 |------|---------|----------|
-| **Assembly** | CNC_01, CNC_02, Robot_Arm_01 | State (RUNNING/IDLE/FAULT), PartCount, CycleTime, ToolWear % |
-| **Process** | Reactor_Tank_01, Reactor_Tank_02 | Temperature °C, Pressure bar, Level %, FlowRate L/min, HeaterOn |
-| **Energy** | Main_Meter, Line_A_Meter, Line_B_Meter | ActivePower kW, EnergyTotal kWh, PowerFactor, Voltage V, Current A |
-| **Packaging** | Packaging_Line_01 | Running, ConveyorSpeed m/min, Throughput units/hr, RejectCount, OEE % |
+| **Assembly** | CNC_01, CNC_02, Robot_Arm_01 | State (RUNNING/IDLE/FAULT), PartCount, CycleTime_sec, ToolWear_pct, Alarm |
+| **Process** | Reactor_Tank_01, Reactor_Tank_02 | Temperature_C, Pressure_bar, Level_pct, FlowRate_L_min, HeaterOn |
+| **Energy** | Main_Meter, Line_A_Meter, Line_B_Meter | ActivePower_kW, EnergyTotal_kWh, PowerFactor, Voltage_V, Current_A |
+| **Packaging** | Packaging_Line_01 | Running, ConveyorSpeed_m_min, Throughput_units_hr, RejectCount, OEE_pct, SupplyFactor_pct |
 
-Faults happen automatically — machines break down, the packaging line stops, tanks drain and refill. You'll see these as state changes in Ignition just as you would from real hardware.
+### How each device behaves
+
+**Assembly machines (CNC_01, CNC_02, Robot_Arm_01)**
+
+Each machine runs a state machine:
+
+```
+RUNNING ──(0.2% chance/tick)──► FAULT ──(30s)──► IDLE ──(10s)──► RUNNING
+   │                                                                   ▲
+   └──(ToolWear reaches 95%)──► IDLE (maintenance, wear resets to 0) ─┘
+```
+
+- Parts are only produced while RUNNING. PartCount increments each completed cycle (~45s).
+- ToolWear accumulates 0.1–0.3% per part. At 95% the machine idles for maintenance.
+- A FAULT sets `Alarm = True` for its duration.
+
+**Process tanks (Reactor_Tank_01, Reactor_Tank_02)**
+
+- Temperature and pressure follow a sinusoidal pattern with Gaussian noise — realistic sensor variation without a flat line.
+- Level drains continuously via flow rate and auto-refills when it drops below 20%.
+- The heater (`HeaterOn`) cuts in when temperature falls below setpoint.
+- Process tanks are independent of Assembly — they represent a separate part of the plant.
+
+**Energy meters**
+
+Energy meters observe the assembly machines and reflect their actual load:
+
+| Meter | Observes | Behaviour |
+|---|---|---|
+| Main_Meter | All 3 machines | Total site load — drops when any machines go down |
+| Line_A_Meter | CNC_01, CNC_02 | CNC line load — tracks CNC states |
+| Line_B_Meter | Robot_Arm_01 | Robot cell load — tracks robot state |
+
+Load formula: `30% base (lighting, HVAC) + 70% variable (machines running)`. When all machines are faulted or idle, meters drop to ~30% of rated power.
+
+**Packaging line**
+
+The packaging line depends on parts supplied by the assembly machines:
+
+- `SupplyFactor_pct` = percentage of assembly machines currently running (0–100%)
+- At 0% supply (all machines down) → line is **forced to stop**, regardless of its own state
+- Reduced supply → higher reject rate (incomplete/rushed parts arriving) → **OEE drops**
+- Recovery probability scales with supply — the line restarts more slowly when parts are scarce
+
+### The causal chain Kafka replay can reconstruct
+
+This is what makes the simulator useful for digital twin work. A sequence of events in the Kafka topics tells a complete story:
+
+```
+T+00s  All machines RUNNING      SupplyFactor=100%  OEE≈75%   Main_Meter≈270kW
+T+47s  CNC_01 → FAULT            SupplyFactor= 67%  OEE falls  Line_A_Meter drops
+T+52s  CNC_02 → FAULT            SupplyFactor= 33%  OEE falls  reject rate rises
+T+81s  Robot_Arm_01 ToolWear 95% SupplyFactor=  0%  Line STOPS Main_Meter≈110kW
+T+92s  CNC_01 recovers           SupplyFactor= 33%  Line can restart
+T+111s CNC_02 recovers           SupplyFactor= 67%  OEE climbs
+T+121s Robot_Arm_01 back online  SupplyFactor=100%  OEE climbs Main_Meter≈270kW
+```
+
+A digital twin replaying these Kafka offsets can answer: "why did OEE drop at 14:32?" — because `SupplyFactor_pct` went to zero two seconds earlier, caused by `ToolWear_pct` crossing 95% on Robot_Arm_01 at 14:31:39.
 
 ---
 
@@ -535,6 +593,40 @@ The Ignition Event Stream source dropdown offers: Event Listener, Kafka, MQTT, S
 **The right approach: Ignition Alarms → Kafka**
 
 Ignition Alarms are designed for exactly this. Configure a quality alarm on each tag (built-in alarm type, triggers when quality transitions to non-Good). Alarms know the exact tag path, the device, the transition time, the previous quality state, and whether the alarm is acknowledged. They survive Ignition restarts and are written to a persistent alarm journal.
+
+Tag quality has exactly three values: **Good**, **Uncertain**, **Bad**. Configure one alarm per quality state (excluding Good) so each transition is captured with the right priority.
+
+**Configuring alarms on all tags automatically**
+
+Rather than clicking each tag individually, run this once in **Tools → Script Console** to add quality alarms to every tag under Factory in one shot. The `"m"` (merge) mode is idempotent — safe to run repeatedly without creating duplicates:
+
+```python
+results = system.tag.browse("[default]Factory", {"recursive": True})
+configs = []
+for tag in results.getResults():
+    configs.append({
+        "path": str(tag["fullPath"]),
+        "alarms": [
+            {"name": "QualityBad",       "mode": "BadQuality",       "priority": "High"},
+            {"name": "QualityUncertain", "mode": "UncertainQuality", "priority": "Medium"},
+        ]
+    })
+if configs:
+    system.tag.configure("[default]", configs, "m")
+```
+
+**Keeping alarms up to date as new devices are added**
+
+The script above only covers tags that exist at the moment you run it. When you add a new device to the simulator and restart it, new tags appear with no alarms. Fix this with a **Gateway Scheduled Script** that runs the same script automatically every 5 minutes.
+
+In Ignition Designer: **Tools → Gateway Scripts → Scheduled → Add Script**
+
+| Setting | Value |
+|---|---|
+| Name | `alarm-auto-configure` |
+| Schedule (CRON Minutes field) | `*/5` — leave Hours, Days, Months, Weekdays as `*` |
+
+Paste the same script from above. Save (Ctrl+S) and **Publish** (Ctrl+Shift+P) — it won't run until published. Since the script uses merge mode, running it every 5 minutes is harmless. New tags from new simulator devices get their quality alarms within 5 minutes of appearing.
 
 Getting alarms into Kafka requires one of two paths. **Check which is available in your install first.**
 

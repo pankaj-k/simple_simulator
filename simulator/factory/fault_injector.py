@@ -45,8 +45,11 @@ class FaultInjector:
                 elif random.random() < self._fault_prob * elapsed:
                     duration = random.uniform(self._min_bad, self._max_bad)
                     self._remaining[key] = duration
-                    tag.quality = "Bad"
+                    # 60% Bad, 40% Uncertain — mirrors real sensor degradation patterns
+                    tag.quality = random.choices(
+                        ["Bad", "Uncertain"], weights=[0.6, 0.4]
+                    )[0]
                     logger.warning(
-                        "Quality FAULT      %-20s  %-30s  (%.0fs)",
-                        device.device_id, tag_name, duration,
+                        "Quality %-9s  %-20s  %-30s  (%.0fs)",
+                        tag.quality.upper(), device.device_id, tag_name, duration,
                     )

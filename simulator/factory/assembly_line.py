@@ -55,6 +55,10 @@ class Machine(Device):
 
         self._sync_tags()
 
+    @property
+    def is_running(self) -> bool:
+        return self._state == MachineState.RUNNING
+
     def _sync_tags(self) -> None:
         self._set("State", self._state.value, datatype="string")
         self._set("PartCount", self._part_count, "parts", "int")
