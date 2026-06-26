@@ -877,3 +877,17 @@ Check your broker is running (`mosquitto` or similar). Confirm the broker addres
 
 **Sparkplug B: tags not appearing in Ignition**
 Ensure the MQTT Engine module is licensed and configured with the correct broker. The group ID and edge node ID in `factory.yaml` must match what MQTT Engine is scanning for.
+
+**Event Stream shows "Events Received: 0" after editing any part of the stream**
+Editing any part of an Event Stream in Ignition — including just the error handler script — silently clears the Source tag path subscription on save. The stream reports "Event Stream running" and shows no errors, but receives nothing. Gateway restart and Disable → Enable do not fix it.
+
+Symptoms:
+- `Events Received: 0` in the Status panel
+- OPC UA connection is green, tag values are actively changing in the tag browser
+- Other streams that were not edited continue working normally
+
+Fix: click the **Source** block of the affected stream, re-enter the tag path (e.g. `[default]Factory/Assembly/**`), and save. Events will start flowing immediately.
+
+To confirm the issue is the tag path and not the infrastructure, create a fresh test stream with the same tag path and no handler — if it receives events, the existing stream's source path was cleared.
+
+**Safest way to edit an Event Stream without losing the tag path subscription:** note down the tag path before making any changes. After saving, immediately check the Source block to confirm the path is still there.

@@ -300,6 +300,22 @@ Result in Kafka:
 }
 ```
 
+### Warning: editing any part of an Event Stream silently clears the tag path
+
+This one cost hours. After editing **any** part of a value stream — including just the error handler script — Ignition silently clears the Source tag path subscription on save. The stream reports "Event Stream running" with no errors, but `Events Received` drops to 0 and stays there. Gateway restart and Disable → Enable do not fix it.
+
+**How it presents:**
+- Source counter shows 0
+- OPC UA is connected, tag values actively changing in tag browser
+- factory-alarm-listener (Event Listener source) still works fine — only Tag Event sources are affected
+- No error in logs, no warning on save
+
+**The fix:** click the Source block of the broken stream, re-enter the tag path (`[default]Factory/Assembly/**` etc.), save. Events resume immediately.
+
+**Diagnostic shortcut:** create a brand new stream with the same tag path and no handler. If it receives events within 10 seconds, the existing stream's source path was silently cleared — the infrastructure is fine.
+
+**Prevention:** before editing any stream, note the tag path. After saving, immediately click the Source block to verify the path survived.
+
 ### Step 6 — Add an Error Handler
 
 Without this, errors disappear silently. Add to the Error Handler stage:
